@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # @lint-avoid-python-3-compatibility-imports
 #
 # uflow  Trace method execution flow in high-level languages.
@@ -12,11 +12,13 @@
 # 27-Oct-2016   Sasha Goldshtein   Created this.
 
 from __future__ import print_function
+
 import argparse
-from bcc import BPF, USDT, utils
 import ctypes as ct
 import time
-import os
+
+from bcc import BPF, USDT, utils
+from bcc.syscall import syscall_name
 
 languages = ["java", "perl", "php", "python", "ruby", "tcl"]
 
@@ -51,10 +53,30 @@ struct call_t {
     u64 pid;                    // (tgid << 32) + pid from bpf_get_current...
     char clazz[80];
     char method[80];
+    int syscall;
 };
 
 BPF_PERF_OUTPUT(calls);
 BPF_HASH(entry, u64, u64);
+
+
+
+TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
+    u64 *depth;
+    u64 pid = bpf_get_current_pid_tgid();
+    depth = entry.lookup(&pid);
+    if (!depth) {
+        return 0;
+    }
+    
+    struct call_t data = {};
+    data.depth = *depth;
+    data.pid = pid;
+    data.syscall = (int)(args->id);
+
+    calls.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
 """
 
 prefix_template = """
@@ -76,13 +98,14 @@ if args.method:
 
 trace_template = """
 int NAME(struct pt_regs *ctx) {
-    u64 *depth, zero = 0, clazz = 0, method = 0 ;
+    u64 *depth, zero = 0, clazz = 0, method = 0, none = -1;
     struct call_t data = {};
 
     READ_CLASS
     READ_METHOD
-    bpf_probe_read_user(&data.clazz, sizeof(data.clazz), (void *)clazz);
-    bpf_probe_read_user(&data.method, sizeof(data.method), (void *)method);
+    bpf_probe_read(&data.clazz, sizeof(data.clazz), (void *)clazz);
+    bpf_probe_read(&data.method, sizeof(data.method), (void *)method);
+    data.syscall = -1;
 
     FILTER_CLASS
     FILTER_METHOD
@@ -192,7 +215,8 @@ class CallEvent(ct.Structure):
         ("depth", ct.c_ulonglong),
         ("pid", ct.c_ulonglong),
         ("clazz", ct.c_char * 80),
-        ("method", ct.c_char * 80)
+        ("method", ct.c_char * 80),
+        ("syscall", ct.c_int),
         ]
 
 start_ts = time.time()
@@ -201,11 +225,15 @@ def print_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(CallEvent)).contents
     depth = event.depth & (~(1 << 63))
     direction = "<- " if event.depth & (1 << 63) else "-> "
+
+    description = ("<syscall> " + syscall_name(event.syscall).decode('utf-8')) \
+        if event.syscall >= 0 \
+        else (direction +
+              event.clazz.decode('utf-8', 'replace') + "." +
+              event.method.decode('utf-8', 'replace'))
     print("%-3d %-6d %-6d %-8.3f %-40s" % (cpu, event.pid >> 32,
         event.pid & 0xFFFFFFFF, time.time() - start_ts,
-        ("  " * (depth - 1)) + direction + \
-            event.clazz.decode('utf-8', 'replace') + "." + \
-            event.method.decode('utf-8', 'replace')))
+        ("  " * (depth - 1)) + description))
 
 bpf["calls"].open_perf_buffer(print_event)
 while 1:
